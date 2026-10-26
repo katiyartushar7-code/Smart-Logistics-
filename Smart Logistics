@@ -1,0 +1,192 @@
+"""Smart Logistics and Optimization System - integrated pipeline (DSA-II PBL Final)
+Tushar Katiyar | Roll No. 2501331540277 | CCSE0301"""
+import heapq, itertools, math, random, time
+from dataclasses import dataclass
+
+# ---- Module 1: delivery network = complete weighted graph, node 0 = depot ----
+def make_network(n, seed=7):
+    rnd = random.Random(seed)
+    pts = [(rnd.uniform(0, 100), rnd.uniform(0, 100)) for _ in range(n)]
+    return pts, [[math.dist(a, b) for b in pts] for a in pts]
+
+def tour_cost(d, t):
+    return sum(d[a][b] for a, b in zip(t, t[1:]))
+
+# ---- Module 3: Dynamic Programming ----
+def held_karp(d, stops):                      # exact TSP, O(m^2 * 2^m) time
+    m, INF = len(stops), float("inf")
+    if m == 0: return 0.0, [0, 0]
+    dp = [[INF] * m for _ in range(1 << m)]
+    par = [[-1] * m for _ in range(1 << m)]
+    for i in range(m): dp[1 << i][i] = d[0][stops[i]]
+    for mask in range(1, 1 << m):
+        for j in range(m):
+            cur = dp[mask][j]
+            if cur == INF: continue
+            for k in range(m):
+                if mask >> k & 1: continue
+                nm, c = mask | 1 << k, cur + d[stops[j]][stops[k]]
+                if c < dp[nm][k]: dp[nm][k], par[nm][k] = c, j
+    full = (1 << m) - 1
+    best, j = min((dp[full][j] + d[stops[j]][0], j) for j in range(m))
+    seq, mask = [], full
+    while j != -1:
+        seq.append(stops[j]); p = par[mask][j]; mask ^= 1 << j; j = p
+    return best, [0] + seq[::-1] + [0]
+
+def floyd_warshall(d):                        # all-pairs shortest times, O(V^3)
+    g, n = [r[:] for r in d], len(d)
+    for k in range(n):
+        for i in range(n):
+            for j in range(n):
+                if g[i][k] + g[k][j] < g[i][j]: g[i][j] = g[i][k] + g[k][j]
+    return g
+
+def nearest_neighbour(d, stops):              # greedy heuristic, O(m^2)
+    left, t = set(stops), [0]
+    while left:
+        nxt = min(left, key=lambda s: d[t[-1]][s]); t.append(nxt); left.remove(nxt)
+    t.append(0)
+    return tour_cost(d, t), t
+
+# ---- Module 4: Branch & Bound (best-first, priority queue) and Backtracking ----
+def branch_and_bound(d, stops, cap=100000):
+    best, tour = nearest_neighbour(d, stops)  # greedy tour = initial upper bound
+    mo = {s: min(d[s][t] for t in stops + [0] if t != s) for s in stops}
+    heap, seen = [(sum(mo.values()), 0.0, [0])], 0
+    while heap and seen < cap:
+        lb, cost, path = heapq.heappop(heap)
+        if lb >= best: return best, tour, seen, True       # optimality proven
+        seen += 1
+        rest = [s for s in stops if s not in path]
+        if not rest:
+            if cost + d[path[-1]][0] < best:
+                best, tour = cost + d[path[-1]][0], path + [0]
+            continue
+        rs = sum(mo[r] for r in rest)
+        for s in rest:                        # lower bound: cost so far + cheapest exits
+            c = cost + d[path[-1]][s]
+            if c + rs < best: heapq.heappush(heap, (c + rs, c, path + [s]))
+    return best, tour, seen, not heap
+
+@dataclass
+class Order:
+    oid: int; node: int; sku: str; qty: int; weight: float; deadline: float; prio: int
+
+def assign_orders(orders, caps, pts):         # backtracking with capacity pruning
+    k = len(caps)
+    srt = sorted(orders, key=lambda o: math.atan2(pts[o.node][1] - 50, pts[o.node][0] - 50))
+    sz = math.ceil(len(srt) / k)              # sweep sectors give vehicle seeds
+    seeds = [[pts[o.node] for o in srt[i * sz:(i + 1) * sz]] or [(50, 50)] for i in range(k)]
+    seeds = [(sum(p[0] for p in g) / len(g), sum(p[1] for p in g) / len(g)) for g in seeds]
+    load, plan = [0.0] * k, {}
+    def place(i):
+        if i == len(srt): return True
+        o = srt[i]
+        for v in sorted(range(k), key=lambda v: math.dist(pts[o.node], seeds[v])):
+            if load[v] + o.weight <= caps[v]:
+                load[v] += o.weight; plan[o.oid] = v
+                if place(i + 1): return True
+                load[v] -= o.weight; del plan[o.oid]
+        return False
+    return plan if place(0) else None
+
+# ---- Module 5: hash-map inventory, priority-queue scheduler, deadlines, traffic ----
+class Inventory:                              # dict = hash map, O(1) average
+    def __init__(self, stock): self.stock = dict(stock)
+    def reserve(self, sku, q):
+        if self.stock.get(sku, 0) >= q: self.stock[sku] -= q; return True
+        return False
+
+def schedule(orders, inv):                    # min-heap: priority first, then deadline
+    heap = [(-o.prio, o.deadline, o.oid, o) for o in orders]; heapq.heapify(heap)
+    ok, held = [], []
+    while heap:
+        o = heapq.heappop(heap)[-1]
+        (ok if inv.reserve(o.sku, o.qty) else held).append(o)
+    return ok, held
+
+def solve_route(d, stops):                    # choose the algorithm by cluster size
+    if len(stops) <= 12: return (*held_karp(d, stops), "DP")
+    c, t, _, exact = branch_and_bound(d, stops)
+    return c, t, ("B&B" if exact else "B&B-capped")
+
+def count_late(d, tour, dl, speed=1.0, service=1.0):
+    t = late = 0
+    for a, b in zip(tour, tour[1:]):
+        t += d[a][b] / speed
+        if b and t > dl[b]: late += 1
+        t += service
+    return late
+
+def apply_traffic(d, seed=3, share=0.25):     # congestion slows a random 25% of roads
+    rnd, e = random.Random(seed), [r[:] for r in d]
+    for i in range(len(d)):
+        for j in range(i + 1, len(d)):
+            if rnd.random() < share: e[i][j] = e[j][i] = d[i][j] * rnd.uniform(1.5, 2.5)
+    return e
+
+def run(n_orders=24, k=4, cap=60.0, seed=7):
+    pts, d = make_network(n_orders + 1, seed)
+    rnd = random.Random(seed + 1)
+    orders = [Order(i, i, rnd.choice("ABC"), rnd.randint(1, 3), rnd.uniform(3, 12),
+                    rnd.uniform(150, 420), rnd.randint(1, 3)) for i in range(1, n_orders + 1)]
+    inv = Inventory({"A": 20, "B": 20, "C": 20})
+    ok, held = schedule(orders, inv)
+    plan = assign_orders(ok, [cap] * k, pts)
+    dl = {o.node: o.deadline for o in ok}
+    base = opt = late_b = late_o = 0
+    for v in range(k):                        # baseline: received order, round-robin
+        stops = [o.node for o in ok if o.oid % k == v]
+        t = [0] + stops + [0]; base += tour_cost(d, t); late_b += count_late(d, t, dl)
+    routes = {}
+    for v in range(k):
+        stops = [o.node for o in ok if plan[o.oid] == v]
+        c, t, m = solve_route(d, stops); routes[v] = (t, m)
+        opt += c; late_o += count_late(d, t, dl)
+    return d, ok, held, base, opt, late_b, late_o, routes
+
+# ---- Testing and validation ----
+def tests():
+    rnd = random.Random(1)
+    for _ in range(20):                       # T1: DP equals brute force (7 stops)
+        _, d = make_network(8, rnd.randint(0, 999)); s = list(range(1, 8))
+        bf = min(tour_cost(d, [0, *p, 0]) for p in itertools.permutations(s))
+        assert abs(held_karp(d, s)[0] - bf) < 1e-9
+    for _ in range(10):                       # T2: Branch & Bound equals DP (9 stops)
+        _, d = make_network(10, rnd.randint(0, 999)); s = list(range(1, 10))
+        c, _, nodes, ex = branch_and_bound(d, s)
+        assert ex and abs(c - held_karp(d, s)[0]) < 1e-9
+    _, d = make_network(25); g = floyd_warshall(apply_traffic(d))
+    assert all(g[i][j] <= g[i][k] + g[k][j] + 1e-9                 # T3: shortest paths
+               for i in range(25) for j in range(25) for k in range(25))
+    inv = Inventory({"A": 5})                 # T4: inventory never goes negative
+    assert inv.reserve("A", 5) and not inv.reserve("A", 1) and inv.stock["A"] == 0
+    o = [Order(1, 1, "A", 1, 5, 100, 1), Order(2, 2, "A", 1, 5, 100, 3)]
+    assert schedule(o, Inventory({"A": 1}))[0][0].oid == 2         # T5: priority first
+    pts, _ = make_network(5)                  # T6: capacity respected / infeasible found
+    ords = [Order(i, i, "A", 1, 10, 99, 1) for i in range(1, 5)]
+    assert assign_orders(ords, [20, 20], pts) is not None and assign_orders(ords, [15, 15], pts) is None
+    d, ok, held, base, opt, lb, lo, routes = run()                 # T7: end-to-end
+    served = sorted(s for t, _ in routes.values() for s in t if s)
+    assert served == sorted(o.node for o in ok) and opt < base
+    pts, d = make_network(25); e = floyd_warshall(apply_traffic(d)); old = new = 0
+    for t, _ in routes.values():              # T8: re-route after live traffic update
+        old += tour_cost(e, t); new += solve_route(e, [s for s in t if s])[0]
+    assert new <= old + 1e-9
+    print(f"T8 traffic: old route {old:.1f}, re-optimised {new:.1f}, saving {100 * (1 - new / old):.1f}%")
+    for m in (10, 12, 14, 16):                # scalability of exact DP
+        _, d = make_network(m + 1); t0 = time.time(); held_karp(d, list(range(1, m + 1)))
+        print(f"Held-Karp {m} stops: {time.time() - t0:.2f} s")
+    _, d = make_network(15); t0 = time.time(); r = branch_and_bound(d, list(range(1, 15)))
+    print(f"B&B 14 stops: {time.time() - t0:.2f} s, nodes {r[2]}, exact {r[3]}")
+    big = [Order(i, 1, "A", 1, 1, 1, i % 3) for i in range(10000)]; t0 = time.time()
+    schedule(big, Inventory({"A": 10 ** 6})); print(f"scheduler 10000 orders: {time.time() - t0:.3f} s")
+    print("all tests passed")
+
+if __name__ == "__main__":
+    d, ok, held, base, opt, lb, lo, routes = run()
+    print(f"dispatched {len(ok)}, held (no stock) {len(held)}")
+    print(f"baseline {base:.1f} km, optimised {opt:.1f} km, saving {100 * (1 - opt / base):.1f}%")
+    print(f"late deliveries: baseline {lb}, optimised {lo}")
+    tests()
